@@ -18,7 +18,9 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tracker.db")
+DB_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(DB_DIR, exist_ok=True)
+DB_PATH = os.path.join(DB_DIR, "tracker.db")
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
