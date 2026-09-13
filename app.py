@@ -785,6 +785,8 @@ def subscribe_push():
     conn.close()
     return jsonify({"success": True, "message": "Device subscribed to 24/7 habit push notifications"})
 
+SENT_REMINDERS_CACHE = set()
+
 def check_and_send_due_reminders():
     if not PYWEBPUSH_AVAILABLE:
         return
@@ -800,6 +802,11 @@ def check_and_send_due_reminders():
     for r in rows:
         habit_time = r["reminder_time"]
         if habit_time != current_hhmm:
+            continue
+
+        # Prevent duplicate notifications for the same habit on the same day at the same minute
+        reminder_key = f"{r['id']}-{current_iso}-{habit_time}"
+        if reminder_key in SENT_REMINDERS_CACHE:
             continue
 
         days_str = r["days"] or "daily"
@@ -824,7 +831,7 @@ def check_and_send_due_reminders():
         if completed:
             continue
 
-        subs = conn.execute("SELECT endpoint, p256dh, auth FROM push_subscriptions").fetchall()
+        subs = conn.execute("SELECT DISTINCT endpoint, p256dh, auth FROM push_subscriptions").fetchall()
         if not subs:
             continue
 
@@ -834,6 +841,7 @@ def check_and_send_due_reminders():
             "url": "/"
         }
 
+        sent_any = False
         for sub in subs:
             try:
                 webpush(
@@ -848,12 +856,16 @@ def check_and_send_due_reminders():
                     vapid_private_key=VAPID_PRIVATE_KEY,
                     vapid_claims={"sub": VAPID_EMAIL}
                 )
+                sent_any = True
             except WebPushException as ex:
                 if ex.response and ex.response.status_code in [404, 410]:
                     with conn:
                         conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (sub["endpoint"],))
             except Exception as e:
                 print(f"[Push Notification Error]: {e}")
+
+        if sent_any:
+            SENT_REMINDERS_CACHE.add(reminder_key)
 
     conn.close()
 
