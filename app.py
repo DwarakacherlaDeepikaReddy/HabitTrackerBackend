@@ -4,9 +4,13 @@ import time
 import uuid
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+# Timezone configuration for reminder scheduler (default to IST UTC+5:30)
+TZ_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", 5.5))
+USER_TZ = timezone(timedelta(hours=TZ_HOURS))
 
 try:
     from pywebpush import webpush, WebPushException
@@ -785,7 +789,7 @@ def check_and_send_due_reminders():
     if not PYWEBPUSH_AVAILABLE:
         return
 
-    now = datetime.now()
+    now = datetime.now(USER_TZ)
     current_iso = now.strftime("%Y-%m-%d")
     current_hhmm = now.strftime("%H:%M")
     day_name = now.strftime("%a")
