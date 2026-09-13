@@ -3,13 +3,27 @@ import json
 import time
 import uuid
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+try:
+    from pywebpush import webpush, WebPushException
+    PYWEBPUSH_AVAILABLE = True
+except ImportError:
+    PYWEBPUSH_AVAILABLE = False
+
+# VAPID Keys for 24/7 Web Push Notifications
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "BNRe9CmGbyI2iX39sc8CBQnMsOdb8oWKOMNzcEi_Z0kS2LUBUQv3-JdHj98f7jXGANUZPEJDAu6Km8r6BLozc88")
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPwBEjQQerY6ZVW7lA4Cim9lNjOWja792-eEBHyRXJfKhRANCAATUXvQphm8iNol9_bHPAgUJzLDnW_KFijjDc3BIv2dJEti1AVEL9_iXR4_fH-41xgDVGTxCQwLuipvK-gS6M3PP")
+VAPID_EMAIL = os.environ.get("VAPID_EMAIL", "mailto:admin@habittracker.com")
+
+
 app = Flask(__name__)
 # Enable CORS for all routes and origins
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
 
 @app.after_request
 def add_cors_headers(response):
@@ -200,6 +214,15 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint TEXT UNIQUE NOT NULL,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                created_at INTEGER
             );
         """)
 
@@ -731,6 +754,118 @@ def save_settings():
             conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, json.dumps(v)))
     conn.close()
     return jsonify({"success": True, "settings": data})
+
+# --- 24/7 Web Push Notification Routes & Scheduler ---
+
+@app.route("/api/push/vapid-public-key", methods=["GET"])
+def get_vapid_public_key():
+    return jsonify({"publicKey": VAPID_PUBLIC_KEY})
+
+@app.route("/api/push/subscribe", methods=["POST"])
+def subscribe_push():
+    data = request.get_json(force=True, silent=True) or {}
+    endpoint = data.get("endpoint")
+    keys = data.get("keys") or {}
+    p256dh = keys.get("p256dh")
+    auth = keys.get("auth")
+
+    if not endpoint or not p256dh or not auth:
+        return jsonify({"error": "Invalid subscription payload"}), 400
+
+    conn = get_db()
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO push_subscriptions (endpoint, p256dh, auth, created_at) VALUES (?, ?, ?, ?)",
+            (endpoint, p256dh, auth, int(time.time() * 1000))
+        )
+    conn.close()
+    return jsonify({"success": True, "message": "Device subscribed to 24/7 habit push notifications"})
+
+def check_and_send_due_reminders():
+    if not PYWEBPUSH_AVAILABLE:
+        return
+
+    now = datetime.now()
+    current_iso = now.strftime("%Y-%m-%d")
+    current_hhmm = now.strftime("%H:%M")
+    day_name = now.strftime("%a")
+
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM habits WHERE active = 1 AND reminder_enabled = 1 AND reminder_time != ''").fetchall()
+
+    for r in rows:
+        habit_time = r["reminder_time"]
+        if habit_time != current_hhmm:
+            continue
+
+        days_str = r["days"] or "daily"
+        days_val = days_str
+        try:
+            days_val = json.loads(days_str)
+        except Exception:
+            pass
+
+        is_scheduled = True
+        if days_val == "weekdays":
+            is_scheduled = day_name not in ["Sat", "Sun"]
+        elif days_val == "weekends":
+            is_scheduled = day_name in ["Sat", "Sun"]
+        elif isinstance(days_val, list):
+            is_scheduled = day_name in days_val
+
+        if not is_scheduled:
+            continue
+
+        completed = conn.execute("SELECT 1 FROM completions WHERE habit_id = ? AND date = ? AND completed = 1", (r["id"], current_iso)).fetchone()
+        if completed:
+            continue
+
+        subs = conn.execute("SELECT endpoint, p256dh, auth FROM push_subscriptions").fetchall()
+        if not subs:
+            continue
+
+        payload = {
+            "title": f"Habit Reminder: {r['name']}",
+            "body": r["description"] or f"It's {habit_time}! Time to complete your habit.",
+            "url": "/"
+        }
+
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": sub["endpoint"],
+                        "keys": {
+                            "p256dh": sub["p256dh"],
+                            "auth": sub["auth"]
+                        }
+                    },
+                    data=json.dumps(payload),
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": VAPID_EMAIL}
+                )
+            except WebPushException as ex:
+                if ex.response and ex.response.status_code in [404, 410]:
+                    with conn:
+                        conn.execute("DELETE FROM push_subscriptions WHERE endpoint = ?", (sub["endpoint"],))
+            except Exception as e:
+                print(f"[Push Notification Error]: {e}")
+
+    conn.close()
+
+def start_reminder_scheduler():
+    def loop():
+        while True:
+            try:
+                check_and_send_due_reminders()
+            except Exception as e:
+                print(f"[Scheduler Exception]: {e}")
+            time.sleep(30)
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+start_reminder_scheduler()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
