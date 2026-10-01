@@ -199,6 +199,8 @@ def init_db():
                 reminder_enabled INTEGER DEFAULT 1,
                 reminder_time TEXT DEFAULT '',
                 sub_items TEXT DEFAULT '[]',
+                carry_pending_enabled INTEGER DEFAULT 0,
+                carry_pending_since TEXT,
                 active INTEGER DEFAULT 1,
                 user_id TEXT,
                 created_at INTEGER
@@ -298,6 +300,9 @@ def init_db():
         for tbl in ["habits", "completions", "sub_completions", "transactions", "categories", "salaries", "todos", "buys", "settings", "push_subscriptions"]:
             ensure_user_id_column(conn, tbl)
         ensure_column(conn, "transactions", "payment_method", "TEXT DEFAULT 'salary'")
+        # These migrations keep existing users' habits unchanged: carry-over is off by default.
+        ensure_column(conn, "habits", "carry_pending_enabled", "INTEGER DEFAULT 0")
+        ensure_column(conn, "habits", "carry_pending_since", "TEXT")
 
         # Seed default categories if empty
         cat_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
@@ -810,6 +815,10 @@ def format_habit(row):
         "reminder_time": row["reminder_time"] or "",
         "subItems": sub_items_val,
         "sub_items": sub_items_val,
+        "carryPendingEnabled": bool(row["carry_pending_enabled"]),
+        "carry_pending_enabled": bool(row["carry_pending_enabled"]),
+        "carryPendingSince": row["carry_pending_since"],
+        "carry_pending_since": row["carry_pending_since"],
         "active": bool(row["active"]),
         "createdAt": created_at_val,
         "created_at": created_at_iso,
@@ -967,8 +976,8 @@ def sync_data():
                 days_json = json.dumps(h.get("days")) if isinstance(h.get("days"), (list, dict)) else str(h.get("days", "daily"))
                 sub_items_json = json.dumps(h.get("subItems") or h.get("sub_items") or [])
                 conn.execute(
-                    """INSERT OR REPLACE INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, active, user_id, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT OR REPLACE INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         h.get("id") or f"h-{int(time.time()*1000)}",
                         h.get("name", ""),
@@ -978,6 +987,8 @@ def sync_data():
                         1 if (h.get("reminderEnabled", True) if "reminderEnabled" in h else h.get("reminder_enabled", True)) else 0,
                         h.get("reminderTime") or h.get("reminder_time", ""),
                         sub_items_json,
+                        1 if (h.get("carryPendingEnabled", False) if "carryPendingEnabled" in h else h.get("carry_pending_enabled", False)) else 0,
+                        h.get("carryPendingSince") or h.get("carry_pending_since"),
                         1 if h.get("active", True) else 0,
                         user_id,
                         h.get("createdAt") or int(time.time() * 1000)
@@ -1106,15 +1117,17 @@ def create_habit():
     reminder_time = data.get("reminder_time") or data.get("reminderTime") or None
     sub_items = data.get("sub_items") or data.get("subItems") or []
     sub_items_str = json.dumps(sub_items)
+    carry_pending_enabled = 1 if (data.get("carry_pending_enabled", False) if "carry_pending_enabled" in data else data.get("carryPendingEnabled", False)) else 0
+    carry_pending_since = (data.get("carry_pending_since") if "carry_pending_since" in data else data.get("carryPendingSince")) or (datetime.now(USER_TZ).date().isoformat() if carry_pending_enabled else None)
     active = 1 if data.get("active", True) else 0
     created_at = int(time.time() * 1000)
 
     conn = get_db()
     with conn:
         conn.execute(
-            """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, active, user_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (habit_id, name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, active, user_id, created_at)
+            """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (habit_id, name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
         )
         row = conn.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
     conn.close()
@@ -1160,13 +1173,30 @@ def update_habit(habit_id):
     sub_items = data.get("sub_items") if "sub_items" in data else data.get("subItems")
     sub_items_str = json.dumps(sub_items) if sub_items is not None else row["sub_items"]
 
+    if "carry_pending_enabled" in data:
+        carry_pending_enabled = 1 if data["carry_pending_enabled"] else 0
+    elif "carryPendingEnabled" in data:
+        carry_pending_enabled = 1 if data["carryPendingEnabled"] else 0
+    else:
+        carry_pending_enabled = row["carry_pending_enabled"]
+    if "carry_pending_since" in data:
+        carry_pending_since = data["carry_pending_since"]
+    elif "carryPendingSince" in data:
+        carry_pending_since = data["carryPendingSince"]
+    elif carry_pending_enabled and not row["carry_pending_enabled"]:
+        carry_pending_since = datetime.now(USER_TZ).date().isoformat()
+    else:
+        carry_pending_since = row["carry_pending_since"]
+    if not carry_pending_enabled:
+        carry_pending_since = None
+
     active = 1 if data.get("active", bool(row["active"])) else 0
 
     with conn:
         conn.execute(
-            """UPDATE habits SET name = ?, description = ?, routine_type = ?, days = ?, reminder_enabled = ?, reminder_time = ?, sub_items = ?, active = ?
+            """UPDATE habits SET name = ?, description = ?, routine_type = ?, days = ?, reminder_enabled = ?, reminder_time = ?, sub_items = ?, carry_pending_enabled = ?, carry_pending_since = ?, active = ?
                WHERE id = ?""",
-            (name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, active, habit_id)
+            (name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, carry_pending_enabled, carry_pending_since, active, habit_id)
         )
         updated_row = conn.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
     conn.close()
