@@ -361,6 +361,28 @@ def init_db():
         ensure_column(conn, "habits", "completion_note_enabled", "INTEGER DEFAULT 0")
         ensure_column(conn, "completions", "note", "TEXT DEFAULT ''")
 
+        # The app stores JavaScript timestamps in milliseconds (13 digits).
+        # PostgreSQL INTEGER is 32-bit and overflows for those values, so keep
+        # all timestamp columns as BIGINT, including existing Neon tables.
+        for table_name, column_name in [
+            ("users", "created_at"),
+            ("auth_otps", "created_at"),
+            ("auth_otps", "expires_at"),
+            ("auth_rate_limits", "window_started"),
+            ("habits", "created_at"),
+            ("completions", "timestamp"),
+            ("sub_completions", "timestamp"),
+            ("transactions", "created_at"),
+            ("categories", "created_at"),
+            ("salaries", "created_at"),
+            ("todos", "created_at"),
+            ("buys", "created_at"),
+            ("push_subscriptions", "created_at"),
+        ]:
+            conn.execute(
+                f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT USING {column_name}::BIGINT"
+            )
+
         # Seed default categories if empty
         cat_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
         if cat_count == 0:
