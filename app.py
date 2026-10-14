@@ -1222,12 +1222,19 @@ def update_habit(habit_id):
 @app.route("/api/habits/<habit_id>", methods=["DELETE"])
 @optional_auth
 def delete_habit(habit_id):
+    user_id = g.current_user_id
     conn = get_db()
     with conn:
-        conn.execute("DELETE FROM habits WHERE id = ?", (habit_id,))
-        conn.execute("DELETE FROM completions WHERE habit_id = ?", (habit_id,))
-        conn.execute("DELETE FROM sub_completions WHERE habit_id = ?", (habit_id,))
+        if user_id:
+            deleted = conn.execute("DELETE FROM habits WHERE id = ? AND user_id = ?", (habit_id, user_id))
+        else:
+            deleted = conn.execute("DELETE FROM habits WHERE id = ? AND (user_id IS NULL OR user_id = '')", (habit_id,))
+        if deleted.rowcount:
+            conn.execute("DELETE FROM completions WHERE habit_id = ?", (habit_id,))
+            conn.execute("DELETE FROM sub_completions WHERE habit_id = ?", (habit_id,))
     conn.close()
+    if not deleted.rowcount:
+        return jsonify({"error": "Habit not found"}), 404
     return jsonify({"success": True, "id": habit_id})
 
 # --- Completions API ---
