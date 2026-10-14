@@ -2,10 +2,11 @@ import os
 import json
 import time
 import uuid
-import sqlite3
 import threading
 import smtplib
 import jwt
+import psycopg2
+from psycopg2.extras import DictCursor
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
@@ -65,16 +66,36 @@ def add_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
-DB_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
-os.makedirs(DB_DIR, exist_ok=True)
-DB_PATH = os.path.join(DB_DIR, "tracker.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+
+class PostgresConnection:
+    """Small adapter that keeps the existing route code readable with psycopg2."""
+    def __init__(self):
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is required. Add the Neon PostgreSQL URL in Render Environment.")
+        self._conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+
+    def execute(self, query, params=None):
+        cursor = self._conn.cursor(cursor_factory=DictCursor)
+        cursor.execute(query.replace("?", "%s"), params)
+        return cursor
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type:
+            self._conn.rollback()
+        else:
+            self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    return conn
+    return PostgresConnection()
 
 DEFAULT_CATEGORIES = [
     {"id": "cat-rent", "name": "Rent", "createdAt": int(time.time() * 1000)},
@@ -163,19 +184,10 @@ DEFAULT_BUYS = [
 ]
 
 def ensure_user_id_column(conn, table_name):
-    try:
-        cursor = conn.execute(f"PRAGMA table_info({table_name})")
-        columns = [row[1] for row in cursor.fetchall()]
-        if "user_id" not in columns:
-            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN user_id TEXT;")
-    except Exception as e:
-        print(f"Migration error on {table_name}: {e}")
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS user_id TEXT")
 
 def ensure_column(conn, table_name, column_name, definition):
-    """Apply a safe SQLite migration when an older local database is reused."""
-    columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
-    if column_name not in columns:
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition};")
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column_name} {definition}")
 
 def init_db():
     conn = get_db()
@@ -208,24 +220,24 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS completions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 habit_id TEXT NOT NULL,
                 date TEXT NOT NULL,
                 completed INTEGER DEFAULT 1,
                 timestamp INTEGER,
                 user_id TEXT,
-                UNIQUE(habit_id, date)
+                UNIQUE(habit_id, date, user_id)
             );
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sub_completions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 habit_id TEXT NOT NULL,
                 sub_id TEXT NOT NULL,
                 date TEXT NOT NULL,
                 timestamp INTEGER,
                 user_id TEXT,
-                UNIQUE(habit_id, sub_id, date)
+                UNIQUE(habit_id, sub_id, date, user_id)
             );
         """)
         conn.execute("""
@@ -280,14 +292,15 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
+                key TEXT NOT NULL,
                 value TEXT,
-                user_id TEXT
+                user_id TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (key, user_id)
             );
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS push_subscriptions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id BIGSERIAL PRIMARY KEY,
                 endpoint TEXT UNIQUE NOT NULL,
                 p256dh TEXT NOT NULL,
                 auth TEXT NOT NULL,
@@ -356,7 +369,10 @@ def init_db():
         settings_count = conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0]
         if settings_count == 0:
             for k, v in DEFAULT_SETTINGS.items():
-                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, json.dumps(v)))
+                conn.execute(
+                    "INSERT INTO settings (key, value, user_id) VALUES (?, ?, '') ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value",
+                    (k, json.dumps(v))
+                )
 
     conn.close()
 
@@ -976,7 +992,7 @@ def sync_data():
                 days_json = json.dumps(h.get("days")) if isinstance(h.get("days"), (list, dict)) else str(h.get("days", "daily"))
                 sub_items_json = json.dumps(h.get("subItems") or h.get("sub_items") or [])
                 conn.execute(
-                    """INSERT OR REPLACE INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
+                    """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         h.get("id") or f"h-{int(time.time()*1000)}",
@@ -1002,7 +1018,7 @@ def sync_data():
                 conn.execute("DELETE FROM completions WHERE (user_id IS NULL OR user_id = '')")
             for c in payload["completions"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO completions (habit_id, date, completed, timestamp, user_id) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO completions (habit_id, date, completed, timestamp, user_id) VALUES (?, ?, ?, ?, ?)",
                     (c.get("habitId"), c.get("date"), 1 if c.get("completed", True) else 0, c.get("timestamp", int(time.time() * 1000)), user_id)
                 )
 
@@ -1013,7 +1029,7 @@ def sync_data():
                 conn.execute("DELETE FROM sub_completions WHERE (user_id IS NULL OR user_id = '')")
             for sc in payload["subCompletions"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO sub_completions (habit_id, sub_id, date, timestamp, user_id) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO sub_completions (habit_id, sub_id, date, timestamp, user_id) VALUES (?, ?, ?, ?, ?)",
                     (sc.get("habitId"), sc.get("subId"), sc.get("date"), sc.get("timestamp", int(time.time() * 1000)), user_id)
                 )
 
@@ -1024,7 +1040,7 @@ def sync_data():
                 conn.execute("DELETE FROM transactions WHERE (user_id IS NULL OR user_id = '')")
             for t in payload["transactions"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO transactions (id, date, amount, category, information, payment_method, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO transactions (id, date, amount, category, information, payment_method, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (t.get("id"), t.get("date"), float(t.get("amount", 0)), t.get("categoryName") or t.get("category", ""), t.get("information", ""), t.get("paymentMethod", "salary"), user_id, t.get("createdAt", int(time.time() * 1000)))
                 )
 
@@ -1035,7 +1051,7 @@ def sync_data():
                 conn.execute("DELETE FROM categories WHERE (user_id IS NULL OR user_id = '')")
             for cat in payload["categories"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO categories (id, name, user_id, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO categories (id, name, user_id, created_at) VALUES (?, ?, ?, ?)",
                     (cat.get("id"), cat.get("name", ""), user_id, cat.get("createdAt", int(time.time() * 1000)))
                 )
 
@@ -1046,7 +1062,7 @@ def sync_data():
                 conn.execute("DELETE FROM salaries WHERE (user_id IS NULL OR user_id = '')")
             for s in payload["salaries"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO salaries (id, date, amount, cycle_start, source, note, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO salaries (id, date, amount, cycle_start, source, note, user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (s.get("id"), s.get("date"), float(s.get("amount", 0)), s.get("cycleStart") or s.get("cycle_start", ""), s.get("source", ""), s.get("note", ""), user_id, s.get("createdAt", int(time.time() * 1000)))
                 )
 
@@ -1057,7 +1073,7 @@ def sync_data():
                 conn.execute("DELETE FROM todos WHERE (user_id IS NULL OR user_id = '')")
             for td in payload["todos"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO todos (id, text, completed, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO todos (id, text, completed, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
                     (td.get("id"), td.get("text", ""), 1 if td.get("completed") else 0, user_id, int(time.time() * 1000))
                 )
 
@@ -1068,16 +1084,16 @@ def sync_data():
                 conn.execute("DELETE FROM buys WHERE (user_id IS NULL OR user_id = '')")
             for b in payload["buys"]:
                 conn.execute(
-                    "INSERT OR REPLACE INTO buys (id, text, completed, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO buys (id, text, completed, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
                     (b.get("id"), b.get("text", ""), 1 if b.get("completed") else 0, user_id, int(time.time() * 1000))
                 )
 
         if "settings" in payload and isinstance(payload["settings"], dict):
             for k, v in payload["settings"].items():
                 if user_id:
-                    conn.execute("INSERT OR REPLACE INTO settings (key, value, user_id) VALUES (?, ?, ?)", (k, json.dumps(v), user_id))
+                    conn.execute("INSERT INTO settings (key, value, user_id) VALUES (?, ?, ?) ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value", (k, json.dumps(v), user_id))
                 else:
-                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, json.dumps(v)))
+                    conn.execute("INSERT INTO settings (key, value, user_id) VALUES (?, ?, '') ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value", (k, json.dumps(v)))
 
     conn.close()
     return jsonify({"success": True, "message": "Data synchronized successfully"})
@@ -1363,9 +1379,9 @@ def save_settings():
     with conn:
         for k, v in data.items():
             if user_id:
-                conn.execute("INSERT OR REPLACE INTO settings (key, value, user_id) VALUES (?, ?, ?)", (k, json.dumps(v), user_id))
+                conn.execute("INSERT INTO settings (key, value, user_id) VALUES (?, ?, ?) ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value", (k, json.dumps(v), user_id))
             else:
-                conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (k, json.dumps(v)))
+                conn.execute("INSERT INTO settings (key, value, user_id) VALUES (?, ?, '') ON CONFLICT (key, user_id) DO UPDATE SET value = EXCLUDED.value", (k, json.dumps(v)))
     conn.close()
     return jsonify({"success": True, "settings": data})
 
@@ -1391,7 +1407,10 @@ def subscribe_push():
     conn = get_db()
     with conn:
         conn.execute(
-            "INSERT OR REPLACE INTO push_subscriptions (endpoint, p256dh, auth, user_id, created_at) VALUES (?, ?, ?, ?, ?)",
+            """INSERT INTO push_subscriptions (endpoint, p256dh, auth, user_id, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT (endpoint) DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth,
+               user_id = EXCLUDED.user_id, created_at = EXCLUDED.created_at""",
             (endpoint, p256dh, auth, user_id, int(time.time() * 1000))
         )
     conn.close()
@@ -1508,5 +1527,5 @@ start_reminder_scheduler()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"* Starting Habit & Money Tracker Flask Backend on port {port}")
-    print(f"* Database location: {DB_PATH}")
+    print("* Database: Neon PostgreSQL")
     app.run(host="0.0.0.0", port=port, debug=True)
