@@ -31,9 +31,14 @@ except ImportError:
 TZ_HOURS = float(os.environ.get("TZ_OFFSET_HOURS", 5.5))
 USER_TZ = timezone(timedelta(hours=TZ_HOURS))
 
-# JWT Configuration
-JWT_SECRET = os.environ.get("JWT_SECRET", "habit-tracker-super-secret-key-2026")
+# JWT / web configuration
+JWT_SECRET = os.environ.get("JWT_SECRET", "").strip()
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "https://habit-tracker-frontend-lilac.vercel.app").rstrip("/")
+LOCAL_FRONTEND_ORIGIN = os.environ.get("LOCAL_FRONTEND_ORIGIN", "http://localhost:5173").rstrip("/")
+
+if len(JWT_SECRET) < 32:
+    raise RuntimeError("JWT_SECRET must be set to a random value of at least 32 characters.")
 
 # SMTP Configuration for Sending Email Reminders
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -54,14 +59,17 @@ VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "MIGHAgEAMBMGByqGSM49AgE
 VAPID_EMAIL = os.environ.get("VAPID_EMAIL", "mailto:admin@habittracker.com")
 
 app = Flask(__name__)
-# Enable CORS for all routes and origins
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+ALLOWED_ORIGINS = {FRONTEND_ORIGIN, LOCAL_FRONTEND_ORIGIN}
+CORS(app, resources={r"/api/*": {"origins": list(ALLOWED_ORIGINS)}})
 
 
 
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    origin = request.headers.get("Origin")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
@@ -198,7 +206,32 @@ def init_db():
                 name TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
+                email_verified INTEGER DEFAULT 0,
+                google_sub TEXT UNIQUE,
+                token_version INTEGER DEFAULT 0,
+                is_admin INTEGER DEFAULT 0,
                 created_at INTEGER
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_otps (
+                email TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                metadata TEXT DEFAULT '{}',
+                expires_at INTEGER NOT NULL,
+                attempts INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (email, purpose)
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_rate_limits (
+                action TEXT NOT NULL,
+                rate_key TEXT NOT NULL,
+                window_started INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (action, rate_key)
             );
         """)
         conn.execute("""
@@ -213,6 +246,7 @@ def init_db():
                 sub_items TEXT DEFAULT '[]',
                 carry_pending_enabled INTEGER DEFAULT 0,
                 carry_pending_since TEXT,
+                completion_note_enabled INTEGER DEFAULT 0,
                 active INTEGER DEFAULT 1,
                 user_id TEXT,
                 created_at INTEGER
@@ -224,6 +258,7 @@ def init_db():
                 habit_id TEXT NOT NULL,
                 date TEXT NOT NULL,
                 completed INTEGER DEFAULT 1,
+                note TEXT DEFAULT '',
                 timestamp INTEGER,
                 user_id TEXT,
                 UNIQUE(habit_id, date, user_id)
@@ -310,12 +345,21 @@ def init_db():
         """)
 
         # Ensure user_id column exists on existing databases
+        ensure_column(conn, "users", "email_verified", "INTEGER DEFAULT 0")
+        ensure_column(conn, "users", "google_sub", "TEXT")
+        ensure_column(conn, "users", "token_version", "INTEGER DEFAULT 0")
+        ensure_column(conn, "users", "is_admin", "INTEGER DEFAULT 0")
+        # Accounts created before email verification was introduced are trusted
+        # legacy accounts; new registrations are only inserted after verification.
+        conn.execute("UPDATE users SET email_verified = 1 WHERE email_verified = 0")
         for tbl in ["habits", "completions", "sub_completions", "transactions", "categories", "salaries", "todos", "buys", "settings", "push_subscriptions"]:
             ensure_user_id_column(conn, tbl)
         ensure_column(conn, "transactions", "payment_method", "TEXT DEFAULT 'salary'")
         # These migrations keep existing users' habits unchanged: carry-over is off by default.
         ensure_column(conn, "habits", "carry_pending_enabled", "INTEGER DEFAULT 0")
         ensure_column(conn, "habits", "carry_pending_since", "TEXT")
+        ensure_column(conn, "habits", "completion_note_enabled", "INTEGER DEFAULT 0")
+        ensure_column(conn, "completions", "note", "TEXT DEFAULT ''")
 
         # Seed default categories if empty
         cat_count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
@@ -381,11 +425,25 @@ init_db()
 # --- JWT Authentication & Middleware ---
 
 def generate_jwt_token(user_id):
+    conn = get_db()
+    row = conn.execute("SELECT token_version FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
     payload = {
         "user_id": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(days=30)
+        "v": row["token_version"] if row else 0,
+        "jti": uuid.uuid4().hex,
+        "exp": datetime.now(timezone.utc) + timedelta(days=7)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def token_is_current(payload):
+    user_id = payload.get("user_id")
+    if not user_id:
+        return False
+    conn = get_db()
+    row = conn.execute("SELECT token_version FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    return bool(row) and int(payload.get("v", -1)) == int(row["token_version"] or 0)
 
 def auth_required(f):
     @wraps(f)
@@ -400,6 +458,8 @@ def auth_required(f):
         
         try:
             data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            if not token_is_current(data):
+                return jsonify({"error": "Session is no longer valid. Please log in again."}), 401
             g.current_user_id = data["user_id"]
         except jwt.ExpiredSignatureError:
             return jsonify({"error": "Session expired, please log in again"}), 401
@@ -418,13 +478,80 @@ def optional_auth(f):
             token = auth_header.split(" ")[1]
             try:
                 data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-                g.current_user_id = data.get("user_id")
+                g.current_user_id = data.get("user_id") if token_is_current(data) else None
             except Exception:
                 pass
         return f(*args, **kwargs)
     return decorated
 
 # --- Multi-User Auth Endpoints ---
+
+OTP_TTL_MS = 15 * 60 * 1000
+
+def auth_client_key():
+    return (request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0]).strip()
+
+def allow_auth_request(action, identifier, limit=5, window_ms=15 * 60 * 1000):
+    now = int(time.time() * 1000)
+    rate_key = f"{auth_client_key()}:{identifier.lower()}"
+    conn = get_db()
+    with conn:
+        row = conn.execute("SELECT window_started, count FROM auth_rate_limits WHERE action = ? AND rate_key = ?", (action, rate_key)).fetchone()
+        if not row or now - int(row["window_started"]) >= window_ms:
+            conn.execute("""INSERT INTO auth_rate_limits (action, rate_key, window_started, count)
+                            VALUES (?, ?, ?, 1)
+                            ON CONFLICT (action, rate_key) DO UPDATE SET window_started = EXCLUDED.window_started, count = 1""", (action, rate_key, now))
+            allowed = True
+        elif int(row["count"]) >= limit:
+            allowed = False
+        else:
+            conn.execute("UPDATE auth_rate_limits SET count = count + 1 WHERE action = ? AND rate_key = ?", (action, rate_key))
+            allowed = True
+    conn.close()
+    return allowed
+
+def create_auth_otp(email, purpose, metadata=None):
+    import secrets
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    now = int(time.time() * 1000)
+    conn = get_db()
+    with conn:
+        conn.execute("""INSERT INTO auth_otps (email, purpose, code_hash, metadata, expires_at, attempts, created_at)
+                        VALUES (?, ?, ?, ?, ?, 0, ?)
+                        ON CONFLICT (email, purpose) DO UPDATE SET code_hash = EXCLUDED.code_hash, metadata = EXCLUDED.metadata,
+                        expires_at = EXCLUDED.expires_at, attempts = 0, created_at = EXCLUDED.created_at""",
+                     (email, purpose, generate_password_hash(code), json.dumps(metadata or {}), now + OTP_TTL_MS, now))
+    conn.close()
+    return code
+
+def consume_auth_otp(email, purpose, code):
+    conn = get_db()
+    now = int(time.time() * 1000)
+    with conn:
+        row = conn.execute("SELECT * FROM auth_otps WHERE email = ? AND purpose = ?", (email, purpose)).fetchone()
+        if not row or now > int(row["expires_at"]) or int(row["attempts"] or 0) >= 5 or not check_password_hash(row["code_hash"], code):
+            if row:
+                conn.execute("UPDATE auth_otps SET attempts = attempts + 1 WHERE email = ? AND purpose = ?", (email, purpose))
+            valid = None
+        else:
+            conn.execute("DELETE FROM auth_otps WHERE email = ? AND purpose = ?", (email, purpose))
+            try:
+                valid = json.loads(row["metadata"] or "{}")
+            except Exception:
+                valid = {}
+    conn.close()
+    return valid
+
+def seed_user_defaults(conn, user_id, created_at):
+    for cat in DEFAULT_CATEGORIES:
+        conn.execute("INSERT INTO categories (id, name, user_id, created_at) VALUES (?, ?, ?, ?)",
+                     (f"{cat['id']}-{uuid.uuid4().hex[:8]}", cat["name"], user_id, created_at))
+    for h in DEFAULT_HABITS:
+        conn.execute("""INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, active, user_id, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     (f"{h['id']}-{uuid.uuid4().hex[:8]}", h["name"], h["description"], h["routine_type"],
+                      json.dumps(h["days"]) if isinstance(h["days"], (list, dict)) else str(h["days"]), h["reminder_enabled"],
+                      h["reminder_time"], json.dumps(h["sub_items"]), h["active"], user_id, created_at))
 
 @app.route("/api/auth/register", methods=["POST", "OPTIONS"])
 def register_user():
@@ -436,62 +563,91 @@ def register_user():
         email = (data.get("email") or "").strip().lower()
         password = data.get("password") or ""
 
-        if not name or not email or not password:
-            return jsonify({"error": "Name, email, and password are required"}), 400
+        if not name or not email or not password or "@" not in email:
+            return jsonify({"error": "Enter a valid name, email, and password."}), 400
 
-        if len(password) < 6:
-            return jsonify({"error": "Password must be at least 6 characters long"}), 400
+        if len(password) < 10:
+            return jsonify({"error": "Password must be at least 10 characters long."}), 400
+        if not allow_auth_request("register", email, limit=3):
+            return jsonify({"error": "Too many registration attempts. Please wait 15 minutes."}), 429
 
         conn = get_db()
         existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
-        if existing:
-            conn.close()
-            return jsonify({"error": "A user with this email already exists"}), 400
-
-        user_id = f"usr-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
-        pw_hash = generate_password_hash(password)
-        created_at = int(time.time() * 1000)
-
-        with conn:
-            conn.execute(
-                "INSERT INTO users (id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, name, email, pw_hash, created_at)
-            )
-            
-            # Seed default categories & habits for new user
-            for cat in DEFAULT_CATEGORIES:
-                conn.execute(
-                    "INSERT INTO categories (id, name, user_id, created_at) VALUES (?, ?, ?, ?)",
-                    (f"{cat['id']}-{uuid.uuid4().hex[:8]}", cat["name"], user_id, created_at)
-                )
-            for h in DEFAULT_HABITS:
-                conn.execute(
-                    """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, active, user_id, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        f"{h['id']}-{uuid.uuid4().hex[:8]}",
-                        h["name"],
-                        h["description"],
-                        h["routine_type"],
-                        json.dumps(h["days"]) if isinstance(h["days"], (list, dict)) else str(h["days"]),
-                        h["reminder_enabled"],
-                        h["reminder_time"],
-                        json.dumps(h["sub_items"]),
-                        h["active"],
-                        user_id,
-                        created_at,
-                    )
-                )
-
         conn.close()
-        token = generate_jwt_token(user_id)
-        return jsonify({
-            "token": token,
-            "user": {"id": user_id, "name": name, "email": email}
-        }), 201
+        if existing:
+            return jsonify({"error": "Unable to create an account with these details."}), 400
+
+        verification_code = create_auth_otp(email, "signup", {"name": name, "password_hash": generate_password_hash(password)})
+        if not send_otp_email(email, name, verification_code, "Verify your Daybook account"):
+            return jsonify({"error": "We could not send the verification email. Please try again later."}), 503
+        return jsonify({"verificationRequired": True, "email": email, "message": "Verification code sent."}), 202
     except Exception as e:
         print(f"[Registration Exception]: {e}")
         return jsonify({"error": f"Registration failed: {str(e)}"}), 500
+
+@app.route("/api/auth/verify-signup", methods=["POST", "OPTIONS"])
+def verify_signup():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    code = (data.get("code") or "").strip()
+    if not email or not code:
+        return jsonify({"error": "Email and verification code are required."}), 400
+    metadata = consume_auth_otp(email, "signup", code)
+    if metadata is None:
+        return jsonify({"error": "Invalid or expired verification code."}), 400
+    conn = get_db()
+    existing = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify({"error": "Unable to verify this account."}), 400
+    user_id = f"usr-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+    created_at = int(time.time() * 1000)
+    with conn:
+        conn.execute("INSERT INTO users (id, name, email, password_hash, email_verified, created_at) VALUES (?, ?, ?, ?, 1, ?)",
+                     (user_id, metadata.get("name", email.split("@")[0]), email, metadata.get("password_hash"), created_at))
+        seed_user_defaults(conn, user_id, created_at)
+    conn.close()
+    return jsonify({"token": generate_jwt_token(user_id), "user": {"id": user_id, "name": metadata.get("name", email.split("@")[0]), "email": email}}), 201
+
+@app.route("/api/auth/request-password-reset", methods=["POST", "OPTIONS"])
+def request_password_reset():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email or "@" not in email:
+        return jsonify({"error": "Enter a valid email address."}), 400
+    if not allow_auth_request("password-reset", email, limit=3):
+        return jsonify({"error": "Too many reset requests. Please wait 15 minutes."}), 429
+    conn = get_db()
+    row = conn.execute("SELECT name, email_verified FROM users WHERE email = ?", (email,)).fetchone()
+    conn.close()
+    if row and bool(row["email_verified"]):
+        code = create_auth_otp(email, "password_reset")
+        send_otp_email(email, row["name"], code, "Reset your Daybook password")
+    return jsonify({"success": True, "message": "If an account exists, a reset code has been sent."})
+
+@app.route("/api/auth/reset-password", methods=["POST", "OPTIONS"])
+def reset_password():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True}), 200
+    data = request.get_json(force=True, silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    code = (data.get("code") or "").strip()
+    password = data.get("password") or ""
+    if not email or not code or len(password) < 10:
+        return jsonify({"error": "Enter your email, reset code, and a password of at least 10 characters."}), 400
+    if consume_auth_otp(email, "password_reset", code) is None:
+        return jsonify({"error": "Invalid or expired reset code."}), 400
+    conn = get_db()
+    with conn:
+        updated = conn.execute("UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE email = ?", (generate_password_hash(password), email))
+    conn.close()
+    if not updated.rowcount:
+        return jsonify({"error": "Unable to reset password."}), 400
+    return jsonify({"success": True, "message": "Password reset. Please sign in with your new password."})
 
 @app.route("/api/auth/login", methods=["POST", "OPTIONS"])
 def login_user():
@@ -504,6 +660,8 @@ def login_user():
 
         if not email or not password:
             return jsonify({"error": "Email and password are required"}), 400
+        if not allow_auth_request("login", email, limit=8):
+            return jsonify({"error": "Too many sign-in attempts. Please wait 15 minutes."}), 429
 
         conn = get_db()
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
@@ -511,6 +669,8 @@ def login_user():
 
         if not row or not check_password_hash(row["password_hash"], password):
             return jsonify({"error": "Invalid email or password"}), 401
+        if not bool(row["email_verified"]):
+            return jsonify({"error": "Please verify your email before signing in."}), 403
 
         user_id = row["id"]
         token = generate_jwt_token(user_id)
@@ -533,8 +693,13 @@ def get_current_user():
     return jsonify({"id": row["id"], "name": row["name"], "email": row["email"]})
 
 @app.route("/api/admin/users", methods=["GET"])
+@auth_required
 def list_all_users():
     conn = get_db()
+    current_user = conn.execute("SELECT is_admin FROM users WHERE id = ?", (g.current_user_id,)).fetchone()
+    if not current_user or not bool(current_user["is_admin"]):
+        conn.close()
+        return jsonify({"error": "Admin access is required."}), 403
     rows = conn.execute("SELECT id, name, email, created_at FROM users ORDER BY created_at DESC").fetchall()
     conn.close()
     users = []
@@ -565,22 +730,17 @@ def google_auth():
         name = (data.get("name") or "").strip()
         google_id = data.get("google_id") or data.get("sub") or ""
 
-        if credential:
-            try:
-                if GOOGLE_AUTH_AVAILABLE and 'google_id_token' in globals() and 'GOOGLE_CLIENT_ID' in globals() and GOOGLE_CLIENT_ID:
-                    google_payload = google_id_token.verify_oauth2_token(
-                        credential, google_requests.Request(), GOOGLE_CLIENT_ID
-                    )
-                else:
-                    google_payload = jwt.decode(credential, options={"verify_signature": False})
-            except Exception:
-                try:
-                    google_payload = jwt.decode(credential, options={"verify_signature": False})
-                except Exception:
-                    google_payload = {}
-            email = (google_payload.get("email") or email).strip().lower()
-            name = (google_payload.get("name") or name).strip()
-            google_id = google_payload.get("sub") or google_id
+        if not credential or not GOOGLE_AUTH_AVAILABLE or not GOOGLE_CLIENT_ID:
+            return jsonify({"error": "Google sign-in is not configured correctly."}), 503
+        try:
+            google_payload = google_id_token.verify_oauth2_token(credential, google_requests.Request(), GOOGLE_CLIENT_ID)
+        except Exception:
+            return jsonify({"error": "Google sign-in could not be verified. Please try again."}), 401
+        if not google_payload.get("email_verified"):
+            return jsonify({"error": "Google did not verify this email address."}), 401
+        email = (google_payload.get("email") or "").strip().lower()
+        name = (google_payload.get("name") or name).strip()
+        google_id = google_payload.get("sub") or ""
 
         if not email:
             return jsonify({"error": "Failed to retrieve email address from Google authentication."}), 400
@@ -589,11 +749,13 @@ def google_auth():
             name = email.split("@")[0].capitalize()
 
         conn = get_db()
-        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE google_sub = ? OR email = ?", (google_id, email)).fetchone()
 
         if row:
             user_id = row["id"]
             user_name = row["name"]
+            with conn:
+                conn.execute("UPDATE users SET google_sub = ?, email_verified = 1 WHERE id = ?", (google_id, user_id))
         else:
             user_id = f"usr-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
             pw_hash = generate_password_hash(f"google-oauth-{google_id}-{time.time()}")
@@ -601,34 +763,9 @@ def google_auth():
             user_name = name
 
             with conn:
-                conn.execute(
-                    "INSERT INTO users (id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, user_name, email, pw_hash, created_at)
-                )
-                # Seed default categories & habits for new Google user
-                for cat in DEFAULT_CATEGORIES:
-                    conn.execute(
-                        "INSERT INTO categories (id, name, user_id, created_at) VALUES (?, ?, ?, ?)",
-                        (f"{cat['id']}-{uuid.uuid4().hex[:8]}", cat["name"], user_id, created_at)
-                    )
-                for h in DEFAULT_HABITS:
-                    conn.execute(
-                        """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, active, user_id, created_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            f"{h['id']}-{uuid.uuid4().hex[:8]}",
-                            h["name"],
-                            h["description"],
-                            h["routine_type"],
-                            json.dumps(h["days"]) if isinstance(h["days"], (list, dict)) else str(h["days"]),
-                            h["reminder_enabled"],
-                            h["reminder_time"],
-                            json.dumps(h["sub_items"]),
-                            h["active"],
-                            user_id,
-                            created_at,
-                        )
-                    )
+                conn.execute("INSERT INTO users (id, name, email, password_hash, email_verified, google_sub, created_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                             (user_id, user_name, email, pw_hash, google_id, created_at))
+                seed_user_defaults(conn, user_id, created_at)
 
         conn.close()
         token = generate_jwt_token(user_id)
@@ -644,13 +781,13 @@ def google_auth():
 
 EMAIL_OTP_CACHE = {}
 
-def send_otp_email(to_email, user_name, code):
+def send_otp_email(to_email, user_name, code, subject="Your Daybook verification code"):
     if not SMTP_EMAIL or not SMTP_PASSWORD:
-        print(f"[OTP Email Notification Log]: Simulated OTP email to {to_email} with code '{code}'")
+        print("[OTP Email Send Error]: SMTP_EMAIL and SMTP_PASSWORD are not configured")
         return False
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🔑 Your Daybook Login Code: {code}"
+    msg["Subject"] = subject
     msg["From"] = f"{SMTP_FROM_NAME} <{SMTP_EMAIL}>"
     msg["To"] = to_email
 
@@ -662,7 +799,7 @@ def send_otp_email(to_email, user_name, code):
       <div style="max-width: 480px; margin: 0 auto; background: #ffffff; padding: 28px; border-radius: 16px; border: 1px solid #D8D3C7; text-align: center;">
         <div style="font-size: 32px; margin-bottom: 12px;">🔑</div>
         <h2 style="font-family: Georgia, serif; color: #22281F; margin: 0 0 8px 0; font-size: 22px;">Your Verification Code</h2>
-        <p style="font-size: 14px; color: #4A5245; margin-bottom: 24px;">Use the code below to log in to Daybook Habit Tracker:</p>
+        <p style="font-size: 14px; color: #4A5245; margin-bottom: 24px;">Use the code below to continue with Daybook:</p>
         
         <div style="background: #DCE6DC; border: 2px dashed #3A5A40; border-radius: 12px; padding: 16px 24px; display: inline-block; margin-bottom: 24px;">
           <span style="font-family: 'Courier New', monospace; font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #22281F;">{code}</span>
@@ -691,6 +828,7 @@ def send_otp_email(to_email, user_name, code):
 def send_otp():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
+    return jsonify({"error": "Passwordless login is disabled. Use email verification or password reset instead."}), 410
     try:
         import random
         data = request.get_json(force=True, silent=True) or {}
@@ -730,6 +868,7 @@ def send_otp():
 def verify_otp():
     if request.method == "OPTIONS":
         return jsonify({"ok": True}), 200
+    return jsonify({"error": "Passwordless login is disabled. Use email verification or password reset instead."}), 410
     try:
         data = request.get_json(force=True, silent=True) or {}
         email = (data.get("email") or "").strip().lower()
@@ -835,6 +974,8 @@ def format_habit(row):
         "carry_pending_enabled": bool(row["carry_pending_enabled"]),
         "carryPendingSince": row["carry_pending_since"],
         "carry_pending_since": row["carry_pending_since"],
+        "completionNoteEnabled": bool(row["completion_note_enabled"]),
+        "completion_note_enabled": bool(row["completion_note_enabled"]),
         "active": bool(row["active"]),
         "createdAt": created_at_val,
         "created_at": created_at_iso,
@@ -845,6 +986,7 @@ def format_completion(row):
         "habitId": row["habit_id"],
         "date": row["date"],
         "completed": bool(row["completed"]),
+        "note": row["note"] or "",
         "timestamp": row["timestamp"],
     }
 
@@ -992,8 +1134,8 @@ def sync_data():
                 days_json = json.dumps(h.get("days")) if isinstance(h.get("days"), (list, dict)) else str(h.get("days", "daily"))
                 sub_items_json = json.dumps(h.get("subItems") or h.get("sub_items") or [])
                 conn.execute(
-                    """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, completion_note_enabled, active, user_id, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         h.get("id") or f"h-{int(time.time()*1000)}",
                         h.get("name", ""),
@@ -1005,6 +1147,7 @@ def sync_data():
                         sub_items_json,
                         1 if (h.get("carryPendingEnabled", False) if "carryPendingEnabled" in h else h.get("carry_pending_enabled", False)) else 0,
                         h.get("carryPendingSince") or h.get("carry_pending_since"),
+                        1 if (h.get("completionNoteEnabled", False) if "completionNoteEnabled" in h else h.get("completion_note_enabled", False)) else 0,
                         1 if h.get("active", True) else 0,
                         user_id,
                         h.get("createdAt") or int(time.time() * 1000)
@@ -1018,8 +1161,8 @@ def sync_data():
                 conn.execute("DELETE FROM completions WHERE (user_id IS NULL OR user_id = '')")
             for c in payload["completions"]:
                 conn.execute(
-                    "INSERT INTO completions (habit_id, date, completed, timestamp, user_id) VALUES (?, ?, ?, ?, ?)",
-                    (c.get("habitId"), c.get("date"), 1 if c.get("completed", True) else 0, c.get("timestamp", int(time.time() * 1000)), user_id)
+                    "INSERT INTO completions (habit_id, date, completed, note, timestamp, user_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (c.get("habitId"), c.get("date"), 1 if c.get("completed", True) else 0, c.get("note", ""), c.get("timestamp", int(time.time() * 1000)), user_id)
                 )
 
         if "subCompletions" in payload and isinstance(payload["subCompletions"], list):
@@ -1135,15 +1278,16 @@ def create_habit():
     sub_items_str = json.dumps(sub_items)
     carry_pending_enabled = 1 if (data.get("carry_pending_enabled", False) if "carry_pending_enabled" in data else data.get("carryPendingEnabled", False)) else 0
     carry_pending_since = (data.get("carry_pending_since") if "carry_pending_since" in data else data.get("carryPendingSince")) or (datetime.now(USER_TZ).date().isoformat() if carry_pending_enabled else None)
+    completion_note_enabled = 1 if (data.get("completion_note_enabled", False) if "completion_note_enabled" in data else data.get("completionNoteEnabled", False)) else 0
     active = 1 if data.get("active", True) else 0
     created_at = int(time.time() * 1000)
 
     conn = get_db()
     with conn:
         conn.execute(
-            """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (habit_id, name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, carry_pending_enabled, carry_pending_since, active, user_id, created_at)
+            """INSERT INTO habits (id, name, description, routine_type, days, reminder_enabled, reminder_time, sub_items, carry_pending_enabled, carry_pending_since, completion_note_enabled, active, user_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (habit_id, name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, carry_pending_enabled, carry_pending_since, completion_note_enabled, active, user_id, created_at)
         )
         row = conn.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
     conn.close()
@@ -1206,13 +1350,20 @@ def update_habit(habit_id):
     if not carry_pending_enabled:
         carry_pending_since = None
 
+    if "completion_note_enabled" in data:
+        completion_note_enabled = 1 if data["completion_note_enabled"] else 0
+    elif "completionNoteEnabled" in data:
+        completion_note_enabled = 1 if data["completionNoteEnabled"] else 0
+    else:
+        completion_note_enabled = row["completion_note_enabled"]
+
     active = 1 if data.get("active", bool(row["active"])) else 0
 
     with conn:
         conn.execute(
-            """UPDATE habits SET name = ?, description = ?, routine_type = ?, days = ?, reminder_enabled = ?, reminder_time = ?, sub_items = ?, carry_pending_enabled = ?, carry_pending_since = ?, active = ?
+            """UPDATE habits SET name = ?, description = ?, routine_type = ?, days = ?, reminder_enabled = ?, reminder_time = ?, sub_items = ?, carry_pending_enabled = ?, carry_pending_since = ?, completion_note_enabled = ?, active = ?
                WHERE id = ?""",
-            (name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, carry_pending_enabled, carry_pending_since, active, habit_id)
+            (name, description, routine_type, days_str, reminder_enabled, reminder_time, sub_items_str, carry_pending_enabled, carry_pending_since, completion_note_enabled, active, habit_id)
         )
         updated_row = conn.execute("SELECT * FROM habits WHERE id = ?", (habit_id,)).fetchone()
     conn.close()
@@ -1245,6 +1396,7 @@ def toggle_completion():
     data = request.get_json(force=True, silent=True) or {}
     habit_id = data.get("habitId")
     date = data.get("date")
+    note = data.get("note", "")
     user_id = g.current_user_id
     if not habit_id or not date:
         return jsonify({"error": "habitId and date are required"}), 400
@@ -1258,12 +1410,12 @@ def toggle_completion():
 
         if row:
             new_val = 0 if row["completed"] else 1
-            conn.execute("UPDATE completions SET completed = ?, timestamp = ? WHERE id = ?",
-                         (new_val, int(time.time() * 1000), row["id"]))
+            conn.execute("UPDATE completions SET completed = ?, note = ?, timestamp = ? WHERE id = ?",
+                         (new_val, note or row["note"] or "", int(time.time() * 1000), row["id"]))
             completed = bool(new_val)
         else:
-            conn.execute("INSERT INTO completions (habit_id, date, completed, timestamp, user_id) VALUES (?, ?, 1, ?, ?)",
-                         (habit_id, date, int(time.time() * 1000), user_id))
+            conn.execute("INSERT INTO completions (habit_id, date, completed, note, timestamp, user_id) VALUES (?, ?, 1, ?, ?, ?)",
+                         (habit_id, date, note, int(time.time() * 1000), user_id))
             completed = True
     conn.close()
     return jsonify({"habitId": habit_id, "date": date, "completed": completed})
